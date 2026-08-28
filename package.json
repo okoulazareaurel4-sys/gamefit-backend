@@ -1,0 +1,22 @@
+{
+  "name": "gamefit-backend",
+  "version": "1.0.0",
+  "description": "Backend GameFit : comptes cloud, sync bibliothèque Steam, SOS avec vraie IA (Claude API)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "better-sqlite3": "^11.3.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "openid": "^2.0.7",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0",
+    "stripe": "^16.9.0"
+  }
+}
