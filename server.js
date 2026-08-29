@@ -13,6 +13,9 @@ const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const STEAM_API_KEY = process.env.STEAM_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase(); // 'anthropic' ou 'ollama'
+const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '');
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.1';
 const SELF_URL = process.env.SELF_URL || `http://localhost:${PORT}`;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
@@ -286,6 +289,12 @@ app.post('/api/billing/create-portal-session', authMiddleware, async (req, res) 
 });
 
 function requireSubscription(req, res, next){
+  // Interrupteur de test : REQUIRE_SUBSCRIPTION=false laisse tout le monde utiliser
+  // SOS-IA sans abonnement — pratique pour tester avant d'activer Stripe.
+  // Remets-le à "true" (ou supprime la variable) une fois prêt à facturer pour de vrai.
+  if(process.env.REQUIRE_SUBSCRIPTION === 'false'){
+    return next();
+  }
   const row = db.prepare('SELECT subscription_status FROM users WHERE id = ?').get(req.user.uid);
   if(!row || !isActiveSub(row.subscription_status)){
     return res.status(402).json({ error: 'subscription_required', message: "Cette fonctionnalité nécessite l'abonnement GameFit Premium." });
@@ -294,12 +303,72 @@ function requireSubscription(req, res, next){
 }
 
 /* ============================================================
-   SOS — vraie IA (Claude API), avec contexte PC + jeu + spoiler
+   Fonctions d'appel IA — une par fournisseur. Le endpoint /api/sos
+   choisit laquelle utiliser selon AI_PROVIDER.
+   ============================================================ */
+async function callAnthropic(system, message, image){
+  if(!ANTHROPIC_API_KEY) throw { code: 'not_configured', message: 'ANTHROPIC_API_KEY non configurée côté serveur.' };
+
+  const userContent = [];
+  if(image && image.base64){
+    userContent.push({
+      type: 'image',
+      source: { type: 'base64', media_type: image.mediaType || 'image/png', data: image.base64 }
+    });
+  }
+  userContent.push({ type: 'text', text: message || "Analyse cette capture d'écran des réglages et recommande le meilleur réglage pour chaque option visible." });
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: image ? 900 : 500,
+      system,
+      messages: [{ role: 'user', content: userContent }]
+    })
+  });
+  const json = await r.json();
+  if(!r.ok) throw { code: 'provider_error', message: json.error && json.error.message };
+  return (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+}
+
+async function callOllama(system, message, image){
+  if(!OLLAMA_URL) throw { code: 'not_configured', message: "OLLAMA_URL non configurée côté serveur." };
+
+  const userMessage = {
+    role: 'user',
+    content: message || "Analyse cette capture d'écran des réglages et recommande le meilleur réglage pour chaque option visible."
+  };
+  // Format Ollama : les images vont dans un tableau à part sur le message
+  // (base64 brut, sans préfixe data:image/...), pas mêlées au texte comme Anthropic.
+  if(image && image.base64){
+    userMessage.images = [image.base64];
+  }
+
+  const r = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      stream: false,
+      messages: [{ role: 'system', content: system }, userMessage]
+    })
+  });
+  const json = await r.json();
+  if(!r.ok) throw { code: 'provider_error', message: json.error };
+  return (json.message && json.message.content) || '';
+}
+
+/* ============================================================
+   SOS — vraie IA (Anthropic ou Ollama selon AI_PROVIDER), avec
+   contexte PC + jeu + spoiler
    ============================================================ */
 app.post('/api/sos', authMiddleware, requireSubscription, async (req, res) => {
-  if(!ANTHROPIC_API_KEY){
-    return res.status(503).json({ error: 'ANTHROPIC_API_KEY non configurée côté serveur.' });
-  }
   const { message, game, pcProfile, spoilerLevel, image } = req.body || {};
   if(!message && !image) return res.status(400).json({ error: 'Message ou image manquant' });
 
@@ -315,41 +384,41 @@ ${image ? `- Une capture d'écran des réglages du jeu est jointe. Identifie cha
 ${game ? `Jeu concerné : ${game}.` : "Aucun jeu n'a été précisé par l'utilisateur."}
 ${pcProfile ? `Profil PC de l'utilisateur : ${JSON.stringify(pcProfile)}.` : ''}`;
 
-  const userContent = [];
-  if(image && image.base64){
-    userContent.push({
-      type: 'image',
-      source: { type: 'base64', media_type: image.mediaType || 'image/png', data: image.base64 }
-    });
-  }
-  userContent.push({ type: 'text', text: message || "Analyse cette capture d'écran des réglages et recommande le meilleur réglage pour chaque option visible." });
-
   try{
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: image ? 900 : 500,
-        system,
-        messages: [{ role: 'user', content: userContent }]
-      })
-    });
-    const json = await r.json();
-    if(!r.ok){
-      console.error(json);
-      return res.status(502).json({ error: 'Erreur côté API Claude', detail: json.error && json.error.message });
-    }
-    const text = (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-    res.json({ reply: text || "Je n'ai pas pu générer de réponse cette fois-ci." });
+    const reply = AI_PROVIDER === 'ollama'
+      ? await callOllama(system, message, image)
+      : await callAnthropic(system, message, image);
+    res.json({ reply: reply || "Je n'ai pas pu générer de réponse cette fois-ci." });
   }catch(e){
     console.error(e);
-    res.status(500).json({ error: 'Erreur serveur en appelant Claude.' });
+    if(e && e.code === 'not_configured') return res.status(503).json({ error: e.message });
+    return res.status(502).json({ error: `Erreur côté fournisseur IA (${AI_PROVIDER})`, detail: e && e.message });
   }
+});
+
+/* ============================================================
+   ADMIN — statistiques d'utilisation, protégées par une clé secrète
+   (ADMIN_KEY dans .env). Ouvre simplement l'URL dans un navigateur
+   avec ?key=TA_CLE pour voir les chiffres.
+   ============================================================ */
+app.get('/api/admin/stats', (req, res) => {
+  const ADMIN_KEY = process.env.ADMIN_KEY || '';
+  if(!ADMIN_KEY){
+    return res.status(503).json({ error: "ADMIN_KEY non configurée côté serveur — ajoute-la dans .env pour activer ce endpoint." });
+  }
+  if(req.query.key !== ADMIN_KEY){
+    return res.status(401).json({ error: 'Clé admin invalide ou manquante (?key=...)' });
+  }
+  const count = (sql) => db.prepare(sql).get().c;
+  const stats = {
+    total_comptes: count('SELECT COUNT(*) as c FROM users'),
+    nouveaux_7_jours: count("SELECT COUNT(*) as c FROM users WHERE created_at >= datetime('now','-7 days')"),
+    nouveaux_30_jours: count("SELECT COUNT(*) as c FROM users WHERE created_at >= datetime('now','-30 days')"),
+    abonnes_premium_actifs: count("SELECT COUNT(*) as c FROM users WHERE subscription_status IN ('active','trialing')"),
+    comptes_lies_a_steam: count('SELECT COUNT(*) as c FROM users WHERE steam_id IS NOT NULL'),
+    genere_le: new Date().toISOString(),
+  };
+  res.json(stats);
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
