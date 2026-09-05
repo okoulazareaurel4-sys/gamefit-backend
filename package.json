@@ -1,7 +1,7 @@
 {
   "name": "gamefit-backend",
   "version": "1.0.0",
-  "description": "Backend GameFit : comptes cloud, sync bibliothèque Steam, SOS avec vraie IA (Claude API)",
+  "description": "Backend GameFit : comptes cloud, sync bibliothèque Steam, recherche de vraies configs Steam (Premium)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
