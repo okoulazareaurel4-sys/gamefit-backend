@@ -11,11 +11,6 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const STEAM_API_KEY = process.env.STEAM_API_KEY || '';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-const AI_PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase(); // 'anthropic' ou 'ollama'
-const OLLAMA_URL = (process.env.OLLAMA_URL || '').replace(/\/$/, '');
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.1';
 const SELF_URL = process.env.SELF_URL || `http://localhost:${PORT}`;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
@@ -288,10 +283,11 @@ app.get('/api/auth/steam/return', async (req, res) => {
 });
 
 /* ============================================================
-   ABONNEMENT (Stripe) — GameFit Premium débloque SOS avec vraie IA
-   (message + analyse de capture d'écran) et la recherche des vraies
-   configs Steam. Le reste (comptes, sync Steam, comptes cloud) reste
-   gratuit pour inciter à créer un compte.
+   ABONNEMENT (Stripe) — GameFit Premium débloque le catalogue de
+   jeux vérifiés (vraies configurations officielles, côté front-end)
+   et la recherche Steam en direct pour les autres jeux (ci-dessous).
+   Le reste (comptes, sync Steam, comptes cloud) reste gratuit pour
+   inciter à créer un compte.
    ============================================================ */
 app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res) => {
   if(!stripe || !STRIPE_PRICE_ID){
@@ -445,100 +441,6 @@ app.get('/api/games/lookup', authMiddleware, requireSubscription, async (req, re
   }catch(e){
     console.error(e);
     res.status(502).json({ error: "Erreur lors de la recherche sur Steam." });
-  }
-});
-
-/* ============================================================
-   Fonctions d'appel IA — une par fournisseur. Le endpoint /api/sos
-   choisit laquelle utiliser selon AI_PROVIDER.
-   ============================================================ */
-async function callAnthropic(system, message, image){
-  if(!ANTHROPIC_API_KEY) throw { code: 'not_configured', message: 'ANTHROPIC_API_KEY non configurée côté serveur.' };
-
-  const userContent = [];
-  if(image && image.base64){
-    userContent.push({
-      type: 'image',
-      source: { type: 'base64', media_type: image.mediaType || 'image/png', data: image.base64 }
-    });
-  }
-  userContent.push({ type: 'text', text: message || "Analyse cette capture d'écran des réglages et recommande le meilleur réglage pour chaque option visible." });
-
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: image ? 900 : 500,
-      system,
-      messages: [{ role: 'user', content: userContent }]
-    })
-  });
-  const json = await r.json();
-  if(!r.ok) throw { code: 'provider_error', message: json.error && json.error.message };
-  return (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-}
-
-async function callOllama(system, message, image){
-  if(!OLLAMA_URL) throw { code: 'not_configured', message: "OLLAMA_URL non configurée côté serveur." };
-
-  const userMessage = {
-    role: 'user',
-    content: message || "Analyse cette capture d'écran des réglages et recommande le meilleur réglage pour chaque option visible."
-  };
-  // Format Ollama : les images vont dans un tableau à part sur le message
-  // (base64 brut, sans préfixe data:image/...), pas mêlées au texte comme Anthropic.
-  if(image && image.base64){
-    userMessage.images = [image.base64];
-  }
-
-  const r = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      stream: false,
-      messages: [{ role: 'system', content: system }, userMessage]
-    })
-  });
-  const json = await r.json();
-  if(!r.ok) throw { code: 'provider_error', message: json.error };
-  return (json.message && json.message.content) || '';
-}
-
-/* ============================================================
-   SOS — vraie IA (Anthropic ou Ollama selon AI_PROVIDER), avec
-   contexte PC + jeu + spoiler
-   ============================================================ */
-app.post('/api/sos', authMiddleware, requireSubscription, async (req, res) => {
-  const { message, game, pcProfile, spoilerLevel, image } = req.body || {};
-  if(!message && !image) return res.status(400).json({ error: 'Message ou image manquant' });
-
-  const spoilerText = { hint: 'un petit indice seulement', explain: 'une explication générale sans tout révéler', full: 'la solution complète' }[spoilerLevel] || 'un indice mesuré';
-
-  const system = `Tu es SOS, l'assistant gaming intégré à l'application GameFit. Tu réponds en français, de façon concrète et actionnable.
-Règles :
-- Si le jeu ou l'info nécessaire n'est pas claire, dis-le honnêtement et demande une précision plutôt que d'inventer.
-- Pour les questions de type "je suis bloqué" sur une mission/un boss, respecte le niveau de spoiler demandé : ${spoilerText}.
-- Pour les questions de performance/FPS, utilise le profil PC fourni pour personnaliser les conseils de réglages.
-- Reste concis (quelques phrases ou une petite liste), pas de longue dissertation.
-${image ? `- Une capture d'écran des réglages du jeu est jointe. Identifie chaque option visible (résolution, ombres, textures, anti-aliasing, VSync, upscaling, distance d'affichage, etc.) et donne une recommandation précise pour CHACUNE d'elles, adaptée au profil PC de l'utilisateur. Si un texte est illisible ou coupé sur l'image, dis-le plutôt que d'inventer l'option. Présente la réponse sous forme de petite liste "option → réglage recommandé (pourquoi)".` : ''}
-${game ? `Jeu concerné : ${game}.` : "Aucun jeu n'a été précisé par l'utilisateur."}
-${pcProfile ? `Profil PC de l'utilisateur : ${JSON.stringify(pcProfile)}.` : ''}`;
-
-  try{
-    const reply = AI_PROVIDER === 'ollama'
-      ? await callOllama(system, message, image)
-      : await callAnthropic(system, message, image);
-    res.json({ reply: reply || "Je n'ai pas pu générer de réponse cette fois-ci." });
-  }catch(e){
-    console.error(e);
-    if(e && e.code === 'not_configured') return res.status(503).json({ error: e.message });
-    return res.status(502).json({ error: `Erreur côté fournisseur IA (${AI_PROVIDER})`, detail: e && e.message });
   }
 });
 
